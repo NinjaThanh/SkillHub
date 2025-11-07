@@ -8,10 +8,10 @@ import {
 import firestore, { FirebaseFirestoreTypes } from '@react-native-firebase/firestore';
 import type { FirebaseAuthTypes } from '@react-native-firebase/auth';
 import storage from '@react-native-firebase/storage';
-import DocumentPicker, { types as DocTypes, isInProgress } from 'react-native-document-picker';
+import { pick, keepLocalCopy, types as DocTypes, isErrorWithCode, errorCodes } from '@react-native-documents/picker';
 
 const COLORS = {
-    primary: '#24786D',
+    primary: '#4CAF50',
     background: '#FFFFFF',
     text: '#0F172A',
     mutedText: '#6B7280',
@@ -43,13 +43,13 @@ export type Job = {
 const CATEGORIES = ['All', 'Sửa chữa', 'Thiết kế', 'Web Dev', 'Marketing'] as const;
 
 const VIETNAM_CITIES = [
-    'Hà Nội','TP. Hồ Chí Minh','Đà Nẵng','Hải Phòng','Cần Thơ',
-    'An Giang','Bà Rịa - Vũng Tàu','Bắc Giang','Bắc Kạn','Bạc Liêu','Bắc Ninh','Bến Tre','Bình Dương','Bình Định','Bình Phước','Bình Thuận',
-    'Cà Mau','Cao Bằng','Đắk Lắk','Đắk Nông','Điện Biên','Đồng Nai','Đồng Tháp','Gia Lai','Hà Giang','Hà Nam','Hà Tĩnh','Hải Dương',
-    'Hậu Giang','Hòa Bình','Hưng Yên','Khánh Hòa','Kiên Giang','Kon Tum','Lai Châu','Lâm Đồng','Lạng Sơn','Lào Cai','Long An',
-    'Nam Định','Nghệ An','Ninh Bình','Ninh Thuận','Phú Thọ','Phú Yên','Quảng Bình','Quảng Nam','Quảng Ngãi','Quảng Ninh',
-    'Quảng Trị','Sóc Trăng','Sơn La','Tây Ninh','Thái Bình','Thái Nguyên','Thanh Hóa','Thừa Thiên Huế','Tiền Giang',
-    'Trà Vinh','Tuyên Quang','Vĩnh Long','Vĩnh Phúc','Yên Bái',
+    'Hà Nội', 'TP. Hồ Chí Minh', 'Đà Nẵng', 'Hải Phòng', 'Cần Thơ',
+    'An Giang', 'Bà Rịa - Vũng Tàu', 'Bắc Giang', 'Bắc Kạn', 'Bạc Liêu', 'Bắc Ninh', 'Bến Tre', 'Bình Dương', 'Bình Định', 'Bình Phước', 'Bình Thuận',
+    'Cà Mau', 'Cao Bằng', 'Đắk Lắk', 'Đắk Nông', 'Điện Biên', 'Đồng Nai', 'Đồng Tháp', 'Gia Lai', 'Hà Giang', 'Hà Nam', 'Hà Tĩnh', 'Hải Dương',
+    'Hậu Giang', 'Hòa Bình', 'Hưng Yên', 'Khánh Hòa', 'Kiên Giang', 'Kon Tum', 'Lai Châu', 'Lâm Đồng', 'Lạng Sơn', 'Lào Cai', 'Long An',
+    'Nam Định', 'Nghệ An', 'Ninh Bình', 'Ninh Thuận', 'Phú Thọ', 'Phú Yên', 'Quảng Bình', 'Quảng Nam', 'Quảng Ngãi', 'Quảng Ninh',
+    'Quảng Trị', 'Sóc Trăng', 'Sơn La', 'Tây Ninh', 'Thái Bình', 'Thái Nguyên', 'Thanh Hóa', 'Thừa Thiên Huế', 'Tiền Giang',
+    'Trà Vinh', 'Tuyên Quang', 'Vĩnh Long', 'Vĩnh Phúc', 'Yên Bái',
 ];
 
 const currency = (n: number) =>
@@ -84,6 +84,81 @@ const matchErr = (
     const hay = `${String(code).toLowerCase()} ${String(msg).toLowerCase()}`;
     return hay.includes(needle);
 };
+
+/** Ghi notification vào users/{uid}/notifications để hook/useNotifications đọc & hiển thị */
+const createUserNotification = async (
+    toUid: string,
+    payload: {
+        title: string;
+        body: string;
+        type: 'job_posted' | 'job_applied';
+        jobId?: string;
+        jobTitle?: string;
+        applicantId?: string;
+        applicantName?: string;
+    }
+) => {
+    try {
+        await firestore()
+            .collection('users')
+            .doc(toUid)
+            .collection('notifications')
+            .add({
+                ...payload,
+                read: false,
+                createdAt: firestore.FieldValue.serverTimestamp(),
+            });
+    } catch (e: any) {
+        console.warn('[notify] write failed:', e?.message || e);
+    }
+};
+
+/** ==================== DELETE: chỉ chủ bài mới được xóa ==================== */
+/** Xóa job + toàn bộ applications liên quan + cố gắng dọn file CV trong Storage */
+const deleteJobAndRelated = async (jobId: string, currentUid: string) => {
+    // Double-check chủ sở hữu
+    const docRef = firestore().collection('jobs').doc(jobId);
+    const snap = await docRef.get();
+    if (!snap.exists) throw new Error('Bài đăng không tồn tại hoặc đã bị xóa.');
+    const data = snap.data() as any;
+    if (!data?.ownerId || data.ownerId !== currentUid) {
+        throw new Error('Bạn không thể xóa bài đăng của người khác.');
+    }
+
+    // Xóa applications theo batch
+    while (true) {
+        const aSnap = await firestore()
+            .collection('applications')
+            .where('jobId', '==', jobId)
+            .limit(300)
+            .get();
+        if (aSnap.empty) break;
+
+        const batch = firestore().batch();
+        aSnap.docs.forEach(d => batch.delete(d.ref));
+        await batch.commit();
+    }
+
+    // Best-effort dọn Storage: applications/{jobId}/...
+    try {
+        const prefixRef = storage().ref(`applications/${jobId}`);
+        const stack = [prefixRef];
+        while (stack.length) {
+            const ref = stack.pop()!;
+            const { prefixes, items } = await ref.listAll();
+            if (items?.length) {
+                await Promise.all(items.map(it => it.delete().catch(() => {})));
+            }
+            prefixes?.forEach(p => stack.push(p));
+        }
+    } catch (e) {
+        console.warn('[storage cleanup]', (e as any)?.message ?? e);
+    }
+
+    // Xóa job (rules sẽ kiểm tra ownerId == auth.uid)
+    await docRef.delete();
+};
+/** ======================================================================== */
 
 /* ----------------------- City Picker ----------------------- */
 const CityPickerModal: React.FC<{
@@ -198,7 +273,7 @@ const PostJobModal: React.FC<{
         try {
             setPosting(true);
             setErr(null);
-            await firestore().collection('jobs').add({
+            const newDoc = await firestore().collection('jobs').add({
                 title: title.trim(),
                 description: desc.trim(),
                 location: location.trim(),
@@ -211,6 +286,16 @@ const PostJobModal: React.FC<{
                 posterContact: posterContact?.trim() || undefined,
                 posterAddress: posterAddress?.trim() || undefined,
             });
+
+            // Notification: xác nhận đăng việc cho chính chủ
+            createUserNotification(user.uid, {
+                title: 'Đăng việc thành công',
+                body: `“${title.trim()}” đã được đăng.`,
+                type: 'job_posted',
+                jobId: newDoc.id,
+                jobTitle: title.trim(),
+            });
+
             reset();
             onClose();
             onPosted();
@@ -398,9 +483,7 @@ const ApplyJobModal: React.FC<{
     const [message, setMessage] = useState('Chào anh/chị, em quan tâm công việc này và có thể bắt đầu sớm.');
     const [cvUrl, setCvUrl] = useState('');
 
-    const [pickedFile, setPickedFile] = useState<{
-        uri: string; name: string; size?: number; type?: string;
-    } | null>(null);
+    const [pickedFile, setPickedFile] = useState<{ uri: string; name: string; size?: number; type?: string } | null>(null);
     const [uploading, setUploading] = useState(false);
     const [uploadProgress, setUploadProgress] = useState(0);
 
@@ -418,21 +501,31 @@ const ApplyJobModal: React.FC<{
 
     const pickFile = async () => {
         try {
-            const res = await DocumentPicker.pickSingle({
+            const [res] = await pick({
+                allowMultiSelection: false,
                 type: [DocTypes.pdf, DocTypes.doc, DocTypes.docx, DocTypes.plainText],
-                copyTo: 'cachesDirectory',
-                presentationStyle: 'fullScreen',
             });
-            const uri = res.fileCopyUri ?? res.uri;
+
+            const [local] = await keepLocalCopy({
+                files: [{ uri: res.uri, fileName: res.name ?? 'CV.pdf' }],
+                destination: 'cachesDirectory',
+            });
+
+            const localUri = local?.status === 'success' && local.localUri ? local.localUri : res.uri;
+
             setPickedFile({
-                uri,
+                uri: localUri,
                 name: res.name ?? 'CV',
-                size: typeof res.size === 'number' && isFinite(res.size) ? res.size : undefined, // safe
+                size: typeof res.size === 'number' ? res.size : undefined,
                 type: res.type ?? 'application/octet-stream',
             });
-        } catch (e) {
-            if (DocumentPicker.isCancel(e) || isInProgress(e)) return;
-            Alert.alert('Chọn tệp thất bại', 'Vui lòng thử lại.');
+        } catch (e: any) {
+            if (isErrorWithCode(e)) {
+                if (e.code === errorCodes.OPERATION_CANCELED || e.code === errorCodes.IN_PROGRESS) return;
+                Alert.alert('Chọn tệp thất bại', e.message ?? 'Vui lòng thử lại.');
+            } else {
+                Alert.alert('Chọn tệp thất bại', 'Vui lòng thử lại.');
+            }
         }
     };
 
@@ -491,9 +584,22 @@ const ApplyJobModal: React.FC<{
                 contact: contact.trim(),
                 message: message.trim(),
                 cvUrl: (cvUrl || '').trim() || null,
-                status: 'pending', // pending | viewed | accepted | rejected
+                status: 'pending',
                 createdAt: firestore.FieldValue.serverTimestamp(),
             });
+
+            // Notification: báo cho chủ job
+            if (job.ownerId) {
+                createUserNotification(job.ownerId, {
+                    title: 'Có ứng viên mới',
+                    body: `${applicantName.trim()} đã ứng tuyển “${job.title}”.`,
+                    type: 'job_applied',
+                    jobId: job.id,
+                    jobTitle: job.title,
+                    applicantId: user.uid,
+                    applicantName: applicantName.trim(),
+                });
+            }
 
             Alert.alert('Đã nộp hồ sơ', 'Nhà tuyển dụng sẽ sớm liên hệ bạn.');
             onClose();
@@ -509,7 +615,6 @@ const ApplyJobModal: React.FC<{
                 style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.25)', justifyContent: 'flex-end' }}
             >
                 <View style={[styles.modalSheet, { maxHeight: DETAIL_SHEET_MAX as any }]}>
-                    {/* Scroll để “ô đính kèm CV” không bị che & luôn xem được hết nội dung */}
                     <ScrollView
                         keyboardShouldPersistTaps="handled"
                         contentContainerStyle={{ paddingBottom: 16 }}
@@ -570,7 +675,6 @@ const ApplyJobModal: React.FC<{
                             />
                         </View>
 
-                        {/* Đính kèm CV – full width, viền nét đứt, nổi bật */}
                         <View style={[styles.fieldBlock, { zIndex: 2 }]}>
                             <Text style={styles.label}>Đính kèm CV (PDF/DOC/DOCX)</Text>
 
@@ -638,14 +742,14 @@ const ApplyJobModal: React.FC<{
         </Modal>
     );
 };
-
-/* ----------------------- Detail ----------------------- */
 const JobDetailModal: React.FC<{
     visible: boolean;
     job?: Job;
     onClose: () => void;
     onApply?: (job: Job) => void;
-}> = ({ visible, job, onClose, onApply }) => {
+    currentUserId?: string;
+    onDeleted?: (jobId: string) => void;
+}> = ({ visible, job, onClose, onApply, currentUserId, onDeleted }) => {
     const openContact = () => {
         if (!job?.posterContact) return;
         const c = job.posterContact.trim();
@@ -653,6 +757,33 @@ const JobDetailModal: React.FC<{
         if (/^\+?\d[\d\s\-().]*$/.test(c)) { Linking.openURL(`tel:${c.replace(/[^\d+]/g, '')}`).catch(() => {}); return; }
         if (/^https?:\/\//i.test(c)) { Linking.openURL(c).catch(() => {}); }
     };
+
+    const onDeletePress = () => {
+        if (!job?.id) return;
+        Alert.alert(
+            'Xóa bài đăng?',
+            'Hành động này sẽ xóa cả hồ sơ ứng tuyển liên quan. Bạn có chắc chắn?',
+            [
+                { text: 'Hủy', style: 'cancel' },
+                {
+                    text: 'Xóa',
+                    style: 'destructive',
+                    onPress: async () => {
+                        try {
+                            await deleteJobAndRelated(job.id, String(currentUserId || ''));
+                            onClose();
+                            onDeleted?.(job.id);
+                            Alert.alert('Đã xóa', 'Bài đăng đã được xóa.');
+                        } catch (e: any) {
+                            Alert.alert('Xóa thất bại', e?.message ?? 'Không thể xóa bài. Vui lòng thử lại.');
+                        }
+                    }
+                }
+            ]
+        );
+    };
+
+    const isOwner = !!job && !!currentUserId && job.ownerId === currentUserId;
 
     return (
         <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
@@ -680,21 +811,25 @@ const JobDetailModal: React.FC<{
 
                         <View style={styles.detailCard}>
                             <Text style={styles.detailTitle}>{job?.title}</Text>
+
                             <View style={styles.detailRow}>
                                 <Text style={styles.detailLabel}>Danh mục</Text>
                                 <Text style={styles.detailValue}>{job?.category}</Text>
                             </View>
                             <View style={styles.divider} />
+
                             <View style={styles.detailRow}>
                                 <Text style={styles.detailLabel}>Tỉnh/TP</Text>
                                 <Text style={styles.detailValue}>{job?.location}</Text>
                             </View>
                             <View style={styles.divider} />
+
                             <View style={styles.detailRow}>
                                 <Text style={styles.detailLabel}>Ngân sách</Text>
                                 <Text style={[styles.detailValue, { fontWeight: '800' }]}>{currency(job?.budget || 0)}</Text>
                             </View>
                             <View style={styles.divider} />
+
                             <View style={styles.detailRow}>
                                 <Text style={styles.detailLabel}>Đăng lúc</Text>
                                 <Text style={styles.detailValue}>{formatDate(job?.createdAt)}</Text>
@@ -754,6 +889,19 @@ const JobDetailModal: React.FC<{
                             </Pressable>
                         ) : null}
 
+                        {/* Chỉ chủ bài thấy nút Xóa */}
+                        {isOwner ? (
+                            <Pressable
+                                style={[
+                                    styles.btn,
+                                    { backgroundColor: '#FEE2E2', borderWidth: 1, borderColor: '#FCA5A5', marginTop: 8 }
+                                ]}
+                                onPress={onDeletePress}
+                            >
+                                <Text style={[styles.btnText, { color: '#B91C1C' }]}>Xóa bài đăng</Text>
+                            </Pressable>
+                        ) : null}
+
                         <Pressable style={[styles.btn, styles.btnGhost, { marginTop: 10 }]} onPress={onClose}>
                             <Text style={[styles.btnText, { color: COLORS.text }]}>Đóng</Text>
                         </Pressable>
@@ -764,29 +912,24 @@ const JobDetailModal: React.FC<{
     );
 };
 
-/* ----------------------- Main Tab ----------------------- */
+/* ----------------------- JobsTab ----------------------- */
 const JobsTab: React.FC<Props> = ({ user, displayName }) => {
     const [selectedCat, setSelectedCat] = useState<string>('All');
     const [jobs, setJobs] = useState<Job[]>([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [showPost, setShowPost] = useState(false);
-
     const [detailJob, setDetailJob] = useState<Job | undefined>(undefined);
     const [showDetail, setShowDetail] = useState(false);
-
     const [applyJob, setApplyJob] = useState<Job | undefined>(undefined);
     const [showApply, setShowApply] = useState(false);
-
     const listRef = useRef<FlatList<Job> | null>(null);
 
     useEffect(() => {
         const colRef = firestore().collection('jobs');
-
         if (selectedCat === 'All') {
             let unsub1: (() => void) | null = null;
             let unsub2: (() => void) | null = null;
-
             unsub1 = colRef.orderBy('createdAt', 'desc').onSnapshot(
                 snap => {
                     const list: Job[] = snap.docs.map(d => {
@@ -839,21 +982,17 @@ const JobsTab: React.FC<Props> = ({ user, displayName }) => {
                         );
                         return;
                     }
-
                     if (matchErr(err, 'permission-denied')) {
                         Alert.alert('Lỗi tải dữ liệu', 'Bạn không có quyền đọc dữ liệu. Kiểm tra Firestore Rules hoặc quyền người dùng.');
                         setLoading(false);
                         return;
                     }
-
                     Alert.alert('Lỗi tải dữ liệu', (err as any)?.message ?? 'Vui lòng thử lại');
                     setLoading(false);
                 }
             );
-
             return () => { if (unsub1) unsub1(); if (unsub2) unsub2(); };
         }
-
         const unsub = colRef.where('category', '==', selectedCat).onSnapshot(
             snap => {
                 const list: Job[] = snap.docs.map(d => {
@@ -888,7 +1027,6 @@ const JobsTab: React.FC<Props> = ({ user, displayName }) => {
                 setLoading(false);
             }
         );
-
         return () => unsub();
     }, [selectedCat]);
 
@@ -915,7 +1053,6 @@ const JobsTab: React.FC<Props> = ({ user, displayName }) => {
         const data = selectedCat === 'All'
             ? jobs
             : jobs.filter(j => normalizeCategory(j.category).toLowerCase() === selectedCat.toLowerCase());
-
         const index = data.findIndex(it => it.id === job.id);
         if (index >= 0) {
             listRef.current?.scrollToIndex({ index, animated: true, viewPosition: 0.1 });
@@ -935,15 +1072,12 @@ const JobsTab: React.FC<Props> = ({ user, displayName }) => {
         <View style={styles.card}>
             <Text style={styles.title}>{item.title}</Text>
             <Text style={styles.desc}>{item.description}</Text>
-
             {renderSkillsRow(item.skills)}
-
             {!!item.posterAddress && (
                 <Text style={[styles.desc, { marginTop: 2 }]} numberOfLines={2}>
                     Đ/c người đăng: {item.posterAddress}
                 </Text>
             )}
-
             <View style={styles.bottomRow}>
                 <Text style={styles.location}>{item.location}</Text>
                 <Text style={styles.price}>{currency(item.budget)}</Text>
@@ -1033,14 +1167,17 @@ const JobsTab: React.FC<Props> = ({ user, displayName }) => {
                 user={user}
                 defaultPosterName={displayName}
             />
-
             <JobDetailModal
                 visible={showDetail}
                 job={detailJob}
                 onClose={() => setShowDetail(false)}
                 onApply={(j) => openApply(j)}
+                currentUserId={user.uid}
+                onDeleted={(jobId) => {
+                    setShowDetail(false);
+                    setJobs(prev => prev.filter(j => j.id !== jobId)); // phản hồi tức thời, onSnapshot vẫn đồng bộ
+                }}
             />
-
             <ApplyJobModal
                 visible={showApply}
                 onClose={() => setShowApply(false)}
@@ -1051,7 +1188,6 @@ const JobsTab: React.FC<Props> = ({ user, displayName }) => {
         </View>
     );
 };
-
 export default JobsTab;
 
 /* ----------------------- Styles ----------------------- */
@@ -1080,21 +1216,67 @@ const styles = StyleSheet.create({
         marginBottom: 12, borderWidth: 1, borderColor: COLORS.border,
     },
     title: { fontSize: 15, fontWeight: '800', color: COLORS.text, marginBottom: 4 },
-    desc: { fontSize: 13, color: COLORS.mutedText, marginBottom: 8 },
-    skillChip: {
-        paddingHorizontal: 10, paddingVertical: 6,
-        borderRadius: 12, backgroundColor: COLORS.chip, borderWidth: 1, borderColor: '#D7DEE8',
+    desc: {
+        fontSize: 13,
+        color: COLORS.mutedText,
+        marginBottom: 8
     },
-    skillChipText: { fontSize: 12, color: COLORS.text, fontWeight: '600' },
-    bottomRow: { flexDirection: 'row', justifyContent: 'space-between', marginBottom: 10 },
-    location: { fontSize: 12, color: COLORS.mutedText },
-    price: { fontSize: 14, fontWeight: '800', color: COLORS.text },
-    actions: { flexDirection: 'row' },
-    btnOutline: { flex: 1, borderWidth: 1, borderColor: COLORS.border, borderRadius: 10, paddingVertical: 9, alignItems: 'center', marginRight: 8 },
-    btnOutlineText: { fontSize: 13, fontWeight: '700', color: COLORS.text },
-    btnPrimary: { flex: 1, backgroundColor: COLORS.primary, borderRadius: 10, paddingVertical: 9, alignItems: 'center' },
-    btnPrimaryText: { fontSize: 13, fontWeight: '800', color: '#fff' },
-
+    skillChip: {
+        paddingHorizontal: 10,
+        paddingVertical: 6,
+        borderRadius: 12,
+        backgroundColor: COLORS.chip,
+        borderWidth: 1,
+        borderColor: '#D7DEE8',
+    },
+    skillChipText: {
+        fontSize: 12,
+        color: COLORS.text,
+        fontWeight: '600'
+    },
+    bottomRow: {
+        flexDirection: 'row',
+        justifyContent: 'space-between',
+        marginBottom: 10
+    },
+    location: {
+        fontSize: 12,
+        color: COLORS.mutedText
+    },
+    price: {
+        fontSize: 14,
+        fontWeight: '800',
+        color: COLORS.text
+    },
+    actions: {
+        flexDirection: 'row'
+    },
+    btnOutline: {
+        flex: 1,
+        borderWidth: 1,
+        borderColor: COLORS.border,
+        borderRadius: 10,
+        paddingVertical: 9,
+        alignItems: 'center',
+        marginRight: 8
+    },
+    btnOutlineText: {
+        fontSize: 13,
+        fontWeight: '700',
+        color: COLORS.text
+    },
+    btnPrimary: {
+        flex: 1,
+        backgroundColor: COLORS.primary,
+        borderRadius: 10,
+        paddingVertical: 9,
+        alignItems: 'center'
+    },
+    btnPrimaryText: {
+        fontSize: 13,
+        fontWeight: '800',
+        color: '#fff'
+    },
     modalSheet: {
         backgroundColor: '#fff',
         padding: 18,
@@ -1105,20 +1287,49 @@ const styles = StyleSheet.create({
         shadowRadius: 12,
         elevation: 16,
     },
-    modalTitle: { fontSize: 22, fontWeight: '900', color: COLORS.text, marginBottom: 8 },
-    fieldBlock: { marginTop: 10 },
-    label: { color: COLORS.text, fontWeight: '800', marginBottom: 6 },
+    modalTitle: {
+        fontSize: 22,
+        fontWeight: '900',
+        color: COLORS.text,
+        marginBottom: 8
+    },
+    fieldBlock: {
+        marginTop: 10
+    },
+    label: {
+        color: COLORS.text,
+        fontWeight: '800',
+        marginBottom: 6
+    },
     input: {
         backgroundColor: COLORS.subtle,
-        borderWidth: 1, borderColor: COLORS.border,
-        borderRadius: 12, paddingHorizontal: 12, paddingVertical: 12,
-        color: COLORS.text, fontSize: 14,
+        borderWidth: 1,
+        borderColor: COLORS.border,
+        borderRadius: 12,
+        paddingHorizontal: 12,
+        paddingVertical: 12,
+        color: COLORS.text,
+        fontSize: 14,
     },
-    btn: { flex: 1, height: 44, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-    btnGhost: { backgroundColor: COLORS.subtle, borderWidth: 1, borderColor: COLORS.border },
-    btnPrimaryBig: { backgroundColor: COLORS.primary },
-    btnText: { fontSize: 15, fontWeight: '800' },
-
+    btn: {
+        flex: 1,
+        height: 44,
+        borderRadius: 12,
+        alignItems: 'center',
+        justifyContent: 'center'
+    },
+    btnGhost: {
+        backgroundColor: COLORS.subtle,
+        borderWidth: 1,
+        borderColor: COLORS.border
+    },
+    btnPrimaryBig: {
+        backgroundColor: COLORS.primary
+    },
+    btnText: {
+        fontSize: 15,
+        fontWeight: '800'
+    },
     detailCard: {
         backgroundColor: COLORS.card,
         borderRadius: 14,
@@ -1127,18 +1338,32 @@ const styles = StyleSheet.create({
         padding: 12,
         marginBottom: 12,
     },
-    detailTitle: { fontSize: 18, fontWeight: '900', color: COLORS.text, marginBottom: 6 },
+    detailTitle: {
+        fontSize: 18,
+        fontWeight: '900',
+        color: COLORS.text,
+        marginBottom: 6
+    },
     detailRow: {
         flexDirection: 'row',
         justifyContent: 'space-between',
         alignItems: 'center',
         paddingVertical: 6,
     },
-    detailLabel: { color: COLORS.mutedText, fontWeight: '600' },
-    detailValue: { color: COLORS.text, fontWeight: '700' },
-    divider: { height: 1, backgroundColor: COLORS.divider, marginVertical: 4, borderRadius: 1 },
-
-    // Upload area
+    detailLabel: {
+        color: COLORS.mutedText,
+        fontWeight: '600'
+    },
+    detailValue: {
+        color: COLORS.text,
+        fontWeight: '700'
+    },
+    divider: {
+        height: 1,
+        backgroundColor: COLORS.divider,
+        marginVertical: 4,
+        borderRadius: 1
+    },
     uploadDrop: {
         borderWidth: 1,
         borderStyle: 'dashed',

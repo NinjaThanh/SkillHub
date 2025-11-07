@@ -1,45 +1,33 @@
-/**
- * Sample React Native App
- * https://github.com/facebook/react-native
- *
- * @format
- */
+import React, { useEffect, useRef, useState } from 'react';
+import { View, Text, ActivityIndicator, StatusBar } from 'react-native';
+import auth, { FirebaseAuthTypes } from '@react-native-firebase/auth';
+import AuthRouter from '../SkillHub/src/AuthRouter/AuthRouter';
+import Home from './src/SignedIn/Home';
 
-import { NewAppScreen } from '@react-native/new-app-screen';
-import { StatusBar, StyleSheet, useColorScheme, View } from 'react-native';
-import {
-  SafeAreaProvider,
-  useSafeAreaInsets,
-} from 'react-native-safe-area-context';
-
-function App() {
-  const isDarkMode = useColorScheme() === 'dark';
-
-  return (
-    <SafeAreaProvider>
-      <StatusBar barStyle={isDarkMode ? 'light-content' : 'dark-content'} />
-      <AppContent />
-    </SafeAreaProvider>
-  );
-}
-
-function AppContent() {
-  const safeAreaInsets = useSafeAreaInsets();
-
-  return (
-    <View style={styles.container}>
-      <NewAppScreen
-        templateFileName="App.tsx"
-        safeAreaInsets={safeAreaInsets}
-      />
-    </View>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-});
-
+const App: React.FC = () => {
+    const [user, setUser] = useState<FirebaseAuthTypes.User | null>(null);
+    const [init, setInit] = useState(true);
+    const mountedRef = useRef(true);
+    useEffect(() => {
+        mountedRef.current = true;
+        const unsubscribe = auth().onAuthStateChanged((u) => {
+            if (!mountedRef.current) return;
+            setUser(u);
+            setInit(false);
+        });return () => {
+            mountedRef.current = false;
+            unsubscribe();
+        };
+    }, []);
+    if (init) {
+        return (
+            <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+                <StatusBar barStyle="dark-content" />
+                <ActivityIndicator size="large" />
+                <Text style={{ marginTop: 8 }}>Đang khởi tạo…</Text>
+            </View>
+        );
+    }
+    return user ? <Home user={user} /> : <AuthRouter />;
+};
 export default App;
