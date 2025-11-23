@@ -1,0 +1,276 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    /* ========= Helpers ========= */
+    function isSignedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function isNonEmptyString(s) { return s is string && s.size() > 0; }
+    function hasValidCreatedAt(d) { return d.createdAt is timestamp; }
+
+    // subset check: chỉ cho phép các key trong allowedKeys thay đổi
+    function changedKeysSubset(before, after, allowedKeys) {
+      return allowedKeys.hasAll(before.diff(after).changedKeys());
+    }
+
+    function isValidCategory(c) {
+      return c in ['Sửa chữa','Thiết kế','Web Dev','Marketing'];
+    }
+
+    // vì rules không có toLowerCase(), kiểm tra cặp category/categoryLower theo bảng mapping
+    function pairMatchesCategory(category, categoryLower) {
+      return (category == 'Sửa chữa' && categoryLower == 'sửa chữa')
+          || (category == 'Thiết kế'  && categoryLower == 'thiết kế')
+          || (category == 'Web Dev'   && categoryLower == 'web dev')
+          || (category == 'Marketing' && categoryLower == 'marketing');
+    }
+
+    function isJobOwner(jobId) {
+      return isSignedIn()
+             && get(/databases/$(database)/documents/jobs/$(jobId)).data.ownerId == uid();
+    }
+
+    // check list string (đơn giản, rẻ)
+    function allStrings(list) {
+      return list is list && (list.size() == 0 || list[0] is string);
+    }
+
+    /* ========= USERS ========= */
+    match /users/{userId} {
+      // đổi thành 'true' nếu muốn public profile
+      allow read: if isSignedIn() && userId == uid();
+
+      allow create: if isSignedIn()
+                    && userId == uid()
+                    && isValidUserCreate(request.resource.data);
+
+      allow update: if isSignedIn()
+                    && userId == uid()
+                    && isValidUserUpdate(resource.data, request.resource.data)
+                    && changedKeysSubset(
+                         resource.data,
+                         request.resource.data,
+                         ['fcmTokens','updatedAt','displayName','photoURL']
+                       );
+
+      allow delete: if false;
+
+      function isValidUserCreate(d) {
+        return (!('fcmTokens' in d) || d.fcmTokens is list)
+               && (!('updatedAt' in d) || d.updatedAt is timestamp)
+               && (!('displayName' in d) || (d.displayName is string && d.displayName.size() <= 80));
+      }
+      function isValidUserUpdate(before, after) {
+        return (!('fcmTokens' in after) || after.fcmTokens is list)
+               && (!('updatedAt' in after) || after.updatedAt is timestamp)
+               && (!('displayName' in after) || (after.displayName is string && after.displayName.size() <= 80));
+      }
+
+      /* ---- users/{userId}/notifications ---- */
+      match /notifications/{notifId} {
+        allow read: if isSignedIn() && userId == uid();
+
+        allow create: if isSignedIn()
+                      && isValidNotification(request.resource.data)
+                      && (
+                           (request.resource.data.type == 'job_posted' && userId == uid()) ||
+                           (request.resource.data.type == 'job_applied'
+                            && request.resource.data.applicantId is string
+                            && request.resource.data.applicantId == uid())
+                         );
+
+        // user chỉ được đánh dấu "read"
+        allow update: if isSignedIn()
+                      && userId == uid()
+                      && isValidNotificationUpdate(resource.data, request.resource.data)
+                      && changedKeysSubset(resource.data, request.resource.data, ['read']);
+
+        allow delete: if isSignedIn() && userId == uid();
+      }
+    }
+
+    function isValidNotification(d) {
+      return isNonEmptyString(d.title)
+             && (d.body is string || d.body == null)
+             && (d.type in ['job_posted','job_applied'])
+             && (!('jobId' in d) || d.jobId is string)
+             && (!('jobTitle' in d) || d.jobTitle is string)
+             && (!('applicantId' in d) || d.applicantId is string)
+             && (!('applicantName' in d) || d.applicantName is string)
+             && d.read is bool
+             && d.createdAt is timestamp;
+    }
+    function isValidNotificationUpdate(before, after) {
+      return after.read is bool
+             && (before.read == false && after.read == true || before.read == after.read)
+             && (!('title' in after) || after.title == before.title)
+             && (!('body' in after) || after.body == before.body)
+             && (!('type' in after) || after.type == before.type)
+             && (!('jobId' in after) || after.jobId == before.jobId)
+             && (!('jobTitle' in after) || after.jobTitle == before.jobTitle)
+             && (!('applicantId' in after) || after.applicantId == before.applicantId)
+             && (!('applicantName' in after) || after.applicantName == before.applicantName)
+             && (!('createdAt' in after) || after.createdAt == before.createdAt);
+    }
+
+    /* ========= FREELANCERS ========= */
+    match /freelancers/{fid} {
+      allow read: if true;
+
+      // chỉ owner (ownerId) mới tạo/cập nhật hồ sơ freelancer
+      allow create, update: if isSignedIn()
+                            && request.resource.data.ownerId == uid()
+                            && validFreelancer(request.resource.data);
+
+      allow delete: if false;
+
+      function validFreelancer(d) {
+        return isNonEmptyString(d.name)
+               && isNonEmptyString(d.category)
+               && isNonEmptyString(d.categoryLower)
+               && d.rating is number && d.rating >= 0 && d.rating <= 5
+               && (!('avatar' in d) || d.avatar is string)
+               && (!('intro' in d) || (d.intro is string && d.intro.size() <= 1000))
+               && (!('skills' in d) || allStrings(d.skills))
+               && (!('createdAt' in d) || d.createdAt is timestamp)
+               && (!('updatedAt' in d) || d.updatedAt is timestamp);
+      }
+    }
+
+    /* ========= JOBS ========= */
+    match /jobs/{jid} {
+      allow read: if true;
+
+      allow create: if isSignedIn()
+                    && request.resource.data.ownerId == uid()
+                    && isValidJob(request.resource.data)
+                    && hasValidCreatedAt(request.resource.data);
+
+      allow update: if isSignedIn()
+                    && resource.data.ownerId == uid()
+                    && isValidJob(request.resource.data)
+                    // không được đổi ownerId/createdAt
+                    && request.resource.data.ownerId == resource.data.ownerId
+                    && request.resource.data.createdAt == resource.data.createdAt
+                    && changedKeysSubset(
+                         resource.data,
+                         request.resource.data,
+                         [
+                           'title','description','city','budget','category','categoryLower',
+                           'skills','posterName','posterContact','posterAddress','updatedAt'
+                         ]
+                       );
+
+      allow delete: if isSignedIn() && resource.data.ownerId == uid();
+    }
+
+    function isValidJob(d) {
+      return isNonEmptyString(d.title)
+             && isNonEmptyString(d.description)
+             && isNonEmptyString(d.city)           // đồng bộ UI
+             && isValidCategory(d.category)
+             && isNonEmptyString(d.categoryLower)
+             && pairMatchesCategory(d.category, d.categoryLower)  // kiểm tra cặp hợp lệ
+             && d.budget is number && d.budget >= 0
+             && d.ownerId is string
+             && d.createdAt is timestamp
+             && (!('skills' in d) || d.skills is list)
+             && (!('posterName' in d) || d.posterName is string)
+             && (!('posterContact' in d) || d.posterContact is string)
+             && (!('posterAddress' in d) || d.posterAddress is string)
+             && (!('updatedAt' in d) || d.updatedAt is timestamp);
+    }
+
+    /* ========= APPLICATIONS ========= */
+    match /applications/{appId} {
+      // ứng viên thấy đơn của họ; chủ job thấy đơn thuộc job của họ
+      allow read: if isSignedIn() && (
+        resource.data.applicantId == uid() ||
+        isJobOwner(resource.data.jobId)
+      );
+
+      allow create: if isSignedIn()
+                    && request.resource.data.applicantId == uid()
+                    && !isJobOwner(request.resource.data.jobId)
+                    && isValidApplicationCreate(request.resource.data)
+                    && hasValidCreatedAt(request.resource.data);
+
+      // chủ job cập nhật trạng thái / viewedAt
+      allow update: if isSignedIn()
+                    && isJobOwner(resource.data.jobId)
+                    && isValidApplicationOwnerUpdate(resource.data, request.resource.data)
+                    && changedKeysSubset(resource.data, request.resource.data, ['status','viewedAt']);
+
+      // cho phép xoá bởi ứng viên hoặc chủ job
+      allow delete: if isSignedIn()
+                    && (resource.data.applicantId == uid() || isJobOwner(resource.data.jobId));
+    }
+
+    function isValidApplicationCreate(d) {
+      return isNonEmptyString(d.jobId)
+             && isNonEmptyString(d.jobTitle)
+             && (d.ownerId is string || d.ownerId == null)
+             && isNonEmptyString(d.applicantId)
+             && isNonEmptyString(d.applicantName)
+             && isNonEmptyString(d.contact)
+             && isNonEmptyString(d.message)
+             && (d.cvUrl is string || d.cvUrl == null)
+             && d.status == 'pending'
+             && d.createdAt is timestamp;
+    }
+
+    function isValidApplicationOwnerUpdate(before, after) {
+      return after.status in ['pending','viewed','accepted','rejected']
+             && (!('viewedAt' in after) || after.viewedAt is timestamp)
+             // các trường khác không được phép đổi
+             && after.applicantId == before.applicantId
+             && after.jobId == before.jobId
+             && after.jobTitle == before.jobTitle
+             && after.applicantName == before.applicantName
+             && after.contact == before.contact
+             && after.message == before.message
+             && after.cvUrl == before.cvUrl
+             && after.createdAt == before.createdAt;
+    }
+
+    /* ========= CHATS & MESSAGES ========= */
+    match /chats/{chatId} {
+      // chat: members(list<string>), createdAt, updatedAt?
+      allow create: if isSignedIn()
+                    && request.resource.data.members is list
+                    && request.resource.data.members.size() >= 2
+                    && allStrings(request.resource.data.members)
+                    && request.resource.data.members.hasAny([uid()])
+                    && request.resource.data.createdAt is timestamp;
+
+      allow read, update, delete: if isSignedIn()
+                                  && resource.data.members.hasAny([uid()]);
+
+      match /messages/{msgId} {
+        // message: senderId, text? / attachments?, createdAt
+        allow create: if isSignedIn()
+                      && get(/databases/$(database)/documents/chats/$(chatId)).data.members.hasAny([uid()])
+                      && request.resource.data.senderId == uid()
+                      && isValidMessage(request.resource.data);
+
+        allow read: if isSignedIn()
+                    && get(/databases/$(database)/documents/chats/$(chatId)).data.members.hasAny([uid()]);
+
+        // đơn giản: không cho sửa/xoá
+        allow update, delete: if false;
+      }
+    }
+
+    function isValidMessage(d) {
+      return isNonEmptyString(d.senderId)
+             && (d.text is string || ('attachments' in d))
+             && (!('attachments' in d) || d.attachments is list)
+             && d.createdAt is timestamp;
+    }
+
+    /* ========= Fallback ========= */
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
