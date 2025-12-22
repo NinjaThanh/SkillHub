@@ -1,4 +1,3 @@
-// src/auth/Sign/Sign.tsx
 import React, { useMemo, useState } from 'react';
 import {
     View,
