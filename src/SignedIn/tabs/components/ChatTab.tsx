@@ -1,4 +1,3 @@
-// src/SignedIn/tabs/components/ChatTab.tsx
 import React, {
     useEffect,
     useState,
